@@ -1,0 +1,245 @@
+---
+title: "Milestone Report"
+author: "Chia Ying Lee"
+date: "August 5, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+
+library(magrittr)
+library(data.table)
+library(knitr)
+library(ggplot2)
+library(Matrix)
+library(quanteda)
+```
+
+# Overview
+
+This project aims to develop a text prediction app that provides on-the-fly word suggestions for device users as they type textual input to the device. Such typing functionality is useful in enabling quicker text input on devices where typing is slow or laborious.
+
+Driving the text prediction app is a Natural Language Processing (NLP) based prediction model, trained against a corpora of blog snippets, news articles and tweets. Using data from the corpora to estimate probabilities of ngrams (sequences of n words), we build a Markov chain model for predicting the most probable next word, given the last 1, 2 or 3 words.
+
+<!-- The [`quanteda`](https://cran.r-project.org/web/packages/quanteda/vignettes/quickstart.html) package has a lot of (R-friendly) functionality for NLP. -->
+
+
+# Exploratory Analysis of the Corpora
+
+The corpora are downloaded from [here](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip). 
+
+```{r load-corpora, cache = T}
+path.corpora <- "./Coursera-SwiftKey/final/en_US/"
+
+files.corpora <- c(blogs = "en_US.blogs.txt",
+                   news = "en_US.news.txt",
+                   twitter = "en_US.twitter.txt")
+
+corpora_raw <- lapply(files.corpora, function(f) 
+    readLines(paste0(path.corpora, f), encoding = "UTF-8", skipNul = T))
+
+save(corpora_raw, file = "MilestoneReport_cache/corpora_raw.Rdata")
+```
+
+The documents in the corpora are split into 3 categories: blogs, news and twitter.
+The following table shows the number of documents (blog snippets, news articles or tweets) in each corpus.
+
+```{r corpora-number-of-lines, cache = T, eval = F}
+load("MilestoneReport_cache/corpora_raw.Rdata")
+
+lapply(corpora_raw, length) %>% 
+    melt %>% .[, 2:1] %>%
+    kable(col.names = c("Document Source", "Number of lines"))
+```
+
+|Document Source | Number of lines|
+|:---------------|---------------:|
+|blogs           |          899288|
+|news            |           77259|
+|twitter         |         2360148|
+
+
+Due to the size of the corpora and limited computational resources, we'll perform the analysis on a randomized subset of 10% of each corpus. 
+
+
+```{r subset-corpus, cache = T, eval = F}
+set.seed(1)
+subset.pct <- .1
+
+corpora <- lapply(corpora_raw, function(cps) {
+    cps <- cps[rbinom(length(cps), 1, subset.pct) == 1] %>% corpus
+})
+
+save(corpora, file = "MilestoneReport_cache/corpora.Rdata")
+```
+
+
+The following histogram shows the distribution of the number of sentences in a document.
+
+```{r summary-sent-table, eval = F}
+load("MilestoneReport_cache/corpora.Rdata")
+
+corpus_summary <- lapply(corpora, function(cps) {
+    summary(cps, verbose = F, n = nrow(cps$documents)) %>% as.data.table
+}) %>% rbindlist(idcol = "Category")
+
+save(corpus_summary, file = "MilestoneReport_cache/corpus_summary.Rdata")
+```
+
+```{r plot-corpus-summary, cache = T}
+load("MilestoneReport_cache/corpus_summary.Rdata")
+
+ggplot(corpus_summary[, .(`Number of Documents` = .N), by = .(Category, Sentences)],
+       aes(Sentences, `Number of Documents`, color = Category, fill = Category)) +
+    facet_wrap(~Category, scales = "free", ncol = 1) +
+    geom_col(position = "dodge", alpha = .3) +
+    ggtitle("Historgram of Number of Sentences in a Document")
+```
+
+
+For the purpose of text prediction, it is more meaningful to break up the corpus of documents into a corpus of sentences. The following histogram shows the number of tokens (i.e. words) in each sentence. Interestingly, some sentences are impossibly long, having upwards of 100 words, but these are mostly due to challenges in correctly identifying non-standard English sentences during the sentence-tokenization step.
+
+```{r make-sent-corpus, eval = F}
+sent_corpus <- lapply(corpora, function(cps) {
+    sent <- tokenize(cps, what = "sentence") %>%
+        lapply(function(tkn) corpus(tkn)$documents) %>%
+        rbindlist(idcol = "DocumentSID")
+    corpus(sent$texts, docvars = sent[, .(DocumentSID)]) # Each sentence is tagged with the tweet it originated from
+})
+
+save(sent_corpus, file = "MilestoneReport_cache/sent_corpus.Rdata")
+
+sent_summary <- lapply(sent_corpus, function(cps)
+    summary(cps, verbose = F, n = nrow(cps$documents)) %>% as.data.table) %>%
+    rbindlist(idcol = "Category")
+
+save(sent_summary, file = "MilestoneReport_cache/sent_summary.Rdata")
+
+```
+
+
+```{r plot-sent-summary-tokens, cache = T}
+load("MilestoneReport_cache/sent_corpus.Rdata")
+load("MilestoneReport_cache/sent_summary.Rdata")
+
+ggplot(sent_summary[, .(Avg = mean(Tokens)), by = .(Category, DocumentSID)],
+       aes(Avg, color = Category, fill = Category)) +
+    facet_wrap(~Category, scales = "free", ncol = 1) +
+    geom_histogram(alpha = 0.5, binwidth = 1) +
+    scale_x_continuous(name = "Average Number of Tokens per Sentence") +
+    ggtitle("Histogram of the Average Number of Tokens per Sentence")
+```
+
+
+## Document Feature Matrix
+
+We now look at the document-feature matrix of ngrams, which will be important for building the prediction model. We include several modeling choices:
+
+- Converting to lower case
+- Removing punctuation
+- Keeping stopwords
+
+With these settings, we can investigate the most commonly used ngrams for each category, as shown in the following word clouds for 3grams.
+
+```{r generate-Ngrams, eval = F}
+#' Helper function to generate ngrams
+#' @param InputCorpus
+#' @param N Arguments for tokens_ngrams function
+#' @param skip Arguments for tokens_ngrams function
+#' @param remove A character vector of user-supplied features to ignore, such as
+#'               "stop words", passed to the dfm function
+#' @param ... Arguments to be passed to the tokens function
+getDFM_Ngrams <- function(InputCorpus, N, skip = 0L, remove = NULL, ...) {
+    tokens(InputCorpus, ...) %>% 
+        tokens_ngrams(N, skip) %>% 
+        dfm(verbose = FALSE, remove = remove, ...)
+}
+
+## Generate ngrams
+dfm.1grams <- lapply(sent_corpus, 
+                     function(cps) getDFM_Ngrams(cps, 1, remove_punct = T))
+dfm.2grams <- lapply(sent_corpus, 
+                     function(cps) getDFM_Ngrams(cps, 2, remove_punct = T))
+dfm.3grams <- lapply(sent_corpus, 
+                     function(cps) getDFM_Ngrams(cps, 3, remove_punct = T))
+
+save(dfm.1grams, dfm.2grams, dfm.3grams, file = "MilestoneReport_cache/dfm.Rdata")
+```
+
+
+```{r dfm-wordcloud, cache = T}
+load("MilestoneReport_cache/dfm.Rdata")
+
+# Show the most frequent features
+# lapply(dfm.3grams, function(DFM) topfeatures(DFM, 20))
+
+# Plot the word cloud
+set.seed(42)
+textplot_wordcloud(dfm.3grams$blogs, 
+                   min.freq = 300, 
+                   random.order = FALSE,
+                   rot.per = .25, 
+                   colors = RColorBrewer::brewer.pal(8, "Dark2"))
+title(main = "Word Cloud for Blog 3-grams")
+
+textplot_wordcloud(dfm.3grams$news, 
+                   min.freq = 15, 
+                   random.order = FALSE,
+                   rot.per = .25, 
+                   colors = RColorBrewer::brewer.pal(8, "Dark2"))
+title(main = "Word Cloud for News 3-grams")
+
+textplot_wordcloud(dfm.3grams$twitter, 
+                   min.freq = 250, 
+                   random.order = FALSE,
+                   rot.per = .25, 
+                   colors = RColorBrewer::brewer.pal(8, "Dark2"))
+title(main = "Word Cloud for Twitter 3-grams")
+```
+
+
+# Predictive Model
+
+Using the ngram document feature matrices, we'll build a Markov chain model to predict the next couple of words given the last 1, 2, or 3 words. Additionally, as seem from the word cloud, different categories have different commonly used ngrams, so the predictive model must be trained on each category separately.
+
+### Technical Details of Markov Chain Model
+
+For illustration, we'll describe the case of using the last word to predict the next word; extension to the last 2 or 3 words is obvious. The Markov chain model will using the 2-gram frequencies for estimating the probabilities of the next word given the last word (ie., the transition probabilities).
+
+Let $\mathcal{W} = \{W_1, \dots, W_M\}$ be the dictionary, and let $n_{ij}$ be the frequency of the bigram $(W_i, W_j)$. If the last word is $W_i$, and assuming that there will be a next word (i.e., it's not the end of the sentence), the probability of the next word is
+
+$$ P_{ij} = \frac{n_{ij}}{\sum_j n_{ij}} .$$
+
+Then, the prediction for the next word is the most probable $W_j$:
+
+$$ j = \arg\max_{j'} \{P_{ij'}\}. $$
+
+
+<!-- ```{r Predict1Word-Using1Word} -->
+<!-- Predict1Word.Using1Word__Generator__ <- function() { -->
+<!--     freq2gram <- colSums(twitter.sent_dfm2grams) %>%  -->
+<!--         as.data.table(keep.rownames = "Word1") %>% -->
+<!--         .[, `:=`(c("Word1", "Word2"),  -->
+<!--                  lapply(strsplit(Word1, "_"), function(s) as.list(s[1:2])) %>% rbindlist)] %>% -->
+<!--         .[Word1 != "" & Word2 != ""] # Remove empty words  -->
+
+<!--     freq2gram.top <- freq2gram[, .SD[which.max(`.`)], by = Word1] %>% -->
+<!--         setkey(Word1) -->
+
+<!--     function(word1) {freq2gram.top[.(char_tolower(word1)), Word2]} -->
+<!-- } -->
+
+<!-- Predict1Word.Using1Word <- Predict1Word.Using1Word__Generator__() -->
+<!-- ``` -->
+
+<!-- Now let's try predicting the next word. -->
+<!-- ```{r Examples--Predict1Word-Using1Word} -->
+<!-- Predict1Word.Using1Word("the") -->
+<!-- Predict1Word.Using1Word("go") -->
+<!-- Predict1Word.Using1Word("yayy") # The word 'yayy' is in the corpus but is not the first word of a 2-gram -->
+<!-- Predict1Word.Using1Word("unknown") # The word 'unknown' is not in the corpus -->
+<!-- ``` -->
+
+
+

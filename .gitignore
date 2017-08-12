@@ -1,0 +1,10 @@
+*~
+*.Rhistory
+*_cache*
+*_files*
+
+Coursera-SwiftKey*
+
+refs/
+
+rsconnect/
