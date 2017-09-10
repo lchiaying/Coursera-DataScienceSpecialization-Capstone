@@ -257,10 +257,9 @@ timestamp()
 
 ##
 
-lapply(list.files("data", pattern = "predTop_[1-3]grams_[abnt]", full.names = T),
+lapply(list.files("data", pattern = "predTop_[1-3]grams_[abnt]", full.names = T)[-(1:4)],
        function(fname) {
-           predTop <- read.csv(fname, stringsAsFactors = F)
-           predTop[, V2 := NULL]
-           save(predTop, file = fname)
-           
+           predTop <- read.csv(fname, stringsAsFactors = F) %>% as.data.table
+           predTop[, V2 := NULL][, prob := signif(as.numeric(prob), digits = 5)]
+           write.csv(predTop, file = fname, row.names = F, quote = F)
        })

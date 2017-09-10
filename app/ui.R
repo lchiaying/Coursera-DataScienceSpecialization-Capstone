@@ -18,11 +18,11 @@ shinyUI(fluidPage(
     # Sidebar with a slider input for number of bins 
     sidebarLayout(
         sidebarPanel(
-            # radioButtons(inputId = "sourceType", 
-            #              label   = "Source type", 
-            #              inline  = T, 
-            #              choices = c("blogs", "news", "twitter", "all"), 
-            #              selected = "all"),
+            radioButtons(inputId = "sourceType",
+                         label   = "Source type",
+                         inline  = T,
+                         choices = c("all"), #c("blogs", "news", "twitter", "all"),
+                         selected = "all"),
             
             radioButtons(inputId = "numPreds", 
                          label   = "Prediction Output", 
@@ -46,7 +46,7 @@ shinyUI(fluidPage(
             
             HTML('<br><br>Analytics for top 3 word predictions:<br><br>'),
             
-            DT::dataTableOutput("wordPredictionAnalytics", width = 200),
+            DT::dataTableOutput("wordPredictionAnalytics", width = 300),
             
             actionButton("analytics", "Refresh analytics")
             

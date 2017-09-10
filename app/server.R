@@ -44,20 +44,26 @@ shinyServer(function(input, output) {
     }
     
     #'
-    PredictNextWord <- function(inputWords) {
+    PredictNextWord <- function(inputWords, sourceType = "all") {
         if (length(inputWords) == 0)
             return(predTop$N1[[sourceType]])
         
         N <- min(length(inputWords) + 1, length(predTop)) # Ngram length
         inputWords <- inputWords[length(inputWords) - ((N - 2):0)]
         
-        predictor_ <- NULL
-        while(N > 0 & is.null(predictor_$Word0)) {
-            Ngram_ <- paste(inputWords, collapse = "_")
-            predictor_ <- predTop[[N]][[sourceType]][.(Ngram_)]
-            N <- N - 1
-            inputWords <- inputWords[-1]
-        }
+        Ngram_ <- paste(inputWords, collapse = "_")
+        predictor_ <- predTop[[N]][[sourceType]][.(Ngram_)]
+        if (predictor_[, is.na(Word0[1])])
+            predictor_ <- PredictNextWord(inputWords[-1], sourceType)
+        
+        # predictor_ <- NULL
+        # while(N > 0 & is.null(predictor_)) {
+        #     Ngram_ <- paste(inputWords, collapse = "_")
+        #     predictor_ <- predTop[[N]][[sourceType]][.(Ngram_)]
+        #     if (is.na(predictor_$Word0)) predictor_ <- NULL
+        #     N <- N - 1
+        #     inputWords <- inputWords[-1]
+        # }
         
         predictor_
     }
@@ -74,23 +80,28 @@ shinyServer(function(input, output) {
         
         withProgress(message = 'Loading prediction data', value = 0, {
             dt <- lapply(seq_along(predTop_file_names), function(i) {
-                incProgress(1/length(predTop_file_names), 
-                            detail = sprintf("loading part %i of %i", 
-                                             i, length(predTop_file_names)))
+                prog.detail <- sprintf("loading part %i of %i", 
+                                       i, length(predTop_file_names))
+                incProgress(0, detail = prog.detail)
                 
                 file_names <- predTop_file_names[[i]]
                 
                 lapply(file_names, function(file_name) {
-                    readBin(aws.s3::get_object(file_name, s3BucketName), "character") %>%
-                        read.csv(text = ., stringsAsFactors = FALSE)  %>% 
-                        as.data.table %>%
-                        .[, prob := as.numeric(prob)] %>%
-                        setkey(Ngram)
+                    data <- aws.s3::get_object(file_name, s3BucketName) %>%
+                        readBin("character") %>% 
+                        fread(stringsAsFactors = F, key = "Ngram")
+                    
+                    incProgress(1/(length(predTop_file_names) * length(file_names)),
+                                detail = prog.detail)
+                    
+                    data
                 })
             })
             names(dt) <- names(predTop_file_names)
-            predTop <<- dt
         })
+        
+        predTop <<- dt
+        predictor <<- predTop[[1]][[1]]
         
         "Start typing in an English sentence:\n
 (Add a space after the last word to predict the next word)"
@@ -102,32 +113,21 @@ shinyServer(function(input, output) {
         sourceType <- ifelse(is.null(input$sourceType), "all", input$sourceType)
         
         if (nchar(input$sentence) == 0) {
-            predictor <<- PredictNextWord(character(0))
+            predictor <<- PredictNextWord(character(0), sourceType)
         } else {
-            sent_tokens <- parseSentence(input$sentence)
+            inputWords <- parseSentence(input$sentence) %>% char_tolower
             
-            partialLastWord <- substr(input$sentence, 
-                                      nchar(input$sentence), 
-                                      nchar(input$sentence) + 1) != " "
+            if ((input$sentence %>% substr(., nchar(.), nchar(.)+1)) != " ") 
+                inputWords <- inputWords[-length(inputWords)] # partial last word
             
-            ## 
-            nInputWords <- length(sent_tokens)
-            
-            ##
-            lastWord <- ifelse(partialLastWord, 
-                               ifelse(nInputWords == 1, "", 
-                                      sent_tokens[nInputWords-1]),
-                               sent_tokens[nInputWords])
-            
-            ##
-            predictor <<- PredictNextWord(char_tolower(lastWord))
-            
+            predictor <<- PredictNextWord(inputWords, sourceType)
         }
         
         nextWord <- ifelse(input$numPreds == "Best",
                            predictor[which.max(prob), Word0],
                            predictor[, paste(Word0, collapse = ", ")])
     })
+    
     
     ## predictionOutputLabel
     output$predictionOutputLabel <- renderText({
@@ -142,10 +142,11 @@ shinyServer(function(input, output) {
     ## wordPredictionAnalytics
     output$wordPredictionAnalytics <- DT::renderDataTable({
         input$analytics
-        predictor[, .(Ngram = strsplit(Ngram, "_") %>% 
-                          sapply(function(s) paste(s, collapse = " ")),
-                      `Next Word` = Word0,
-                      Probability = round(prob, digits = 3))]
+        input$sentence
+        predictor[, .(Ngram = if (class(Ngram) != "character") Ngram else
+            sapply(strsplit(Ngram, "_"), function(s) paste(s, collapse = " ")),
+            `Next Word` = Word0,
+            Probability = prob)]
     })
     
 })
